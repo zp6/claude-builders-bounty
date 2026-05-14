@@ -1,0 +1,409 @@
+{
+  "name": "Weekly Dev Report (n8n + Claude)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 17 * * 5"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every Friday 5PM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "repo",
+              "name": "GITHUB_REPO",
+              "value": "={{ $env.GITHUB_REPO }}",
+              "type": "string"
+            },
+            {
+              "id": "token",
+              "name": "GITHUB_TOKEN",
+              "value": "={{ $env.GITHUB_TOKEN }}",
+              "type": "string"
+            },
+            {
+              "id": "anthropic",
+              "name": "ANTHROPIC_API_KEY",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}",
+              "type": "string"
+            },
+            {
+              "id": "lang",
+              "name": "REPORT_LANGUAGE",
+              "value": "={{ $env.REPORT_LANGUAGE || 'EN' }}",
+              "type": "string"
+            },
+            {
+              "id": "webhook",
+              "name": "WEBHOOK_URL",
+              "value": "={{ $env.WEBHOOK_URL || '' }}",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "config",
+      "name": "Load Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate date range: last Friday 17:00 to this Friday 17:00\nconst now = new Date();\nconst dayOfWeek = now.getDay();\nconst diff = dayOfWeek >= 5 ? dayOfWeek - 5 : dayOfWeek + 2;\nconst friday = new Date(now);\nfriday.setDate(now.getDate() - diff);\nfriday.setHours(17, 0, 0, 0);\nconst prevFriday = new Date(friday);\nprevFriday.setDate(friday.getDate() - 7);\n\nreturn [{\n  json: {\n    since: prevFriday.toISOString(),\n    until: friday.toISOString(),\n    sinceShort: prevFriday.toISOString().split('T')[0],\n    untilShort: friday.toISOString().split('T')[0]\n  }\n}];"
+      },
+      "id": "date-range",
+      "name": "Calculate Date Range",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.GITHUB_REPO || $node['Load Config'].json.GITHUB_REPO }}/commits?since={{ $node['Calculate Date Range'].json.since }}&until={{ $node['Calculate Date Range'].json.until }}&per_page=100",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $node['Load Config'].json.GITHUB_TOKEN }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "weekly-report-generator"
+            }
+          ]
+        }
+      },
+      "id": "fetch-commits",
+      "name": "Fetch Commits",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, -100]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $node['Load Config'].json.GITHUB_REPO }}/issues?state=closed&since={{ $node['Calculate Date Range'].json.since }}&per_page=100",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $node['Load Config'].json.GITHUB_TOKEN }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "weekly-report-generator"
+            }
+          ]
+        }
+      },
+      "id": "fetch-issues",
+      "name": "Fetch Issues",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 100]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $node['Load Config'].json.GITHUB_REPO }}/pulls?state=closed&per_page=100&sort=updated&direction=desc",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $node['Load Config'].json.GITHUB_TOKEN }}"
+            },
+            {
+              "name": "User-Agent",
+              "value": "weekly-report-generator"
+            }
+          ]
+        }
+      },
+      "id": "fetch-prs",
+      "name": "Fetch PRs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "id": "merge-data",
+      "name": "Merge All Data",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process and combine all GitHub data\nconst commits = $node['Fetch Commits'].json || [];\nconst issues = ($node['Fetch Issues'].json || []).filter(\n  i => !i.pull_request\n);\nconst prs = ($node['Fetch PRs'].json || []).filter(\n  p => p.merged_at\n);\nconst dates = $node['Calculate Date Range'].json;\nconst config = $node['Load Config'].json;\n\nconst contributors = [...new Set(\n  (Array.isArray(commits) ? commits : []).map(c => c.author?.login).filter(Boolean)\n)];\n\nconst activityData = {\n  repo: config.GITHUB_REPO,\n  period: { from: dates.sinceShort, to: dates.untilShort },\n  stats: {\n    commits: Array.isArray(commits) ? commits.length : 0,\n    issuesClosed: issues.length,\n    prsMerged: prs.length,\n    contributors: contributors.length\n  },\n  commits: (Array.isArray(commits) ? commits : []).slice(0, 50).map(c => ({\n    sha: c.sha?.substring(0, 7),\n    message: c.commit?.message?.split('\\n')[0],\n    author: c.author?.login,\n    date: c.commit?.author?.date,\n    url: c.html_url\n  })),\n  issues: issues.map(i => ({\n    number: i.number,\n    title: i.title,\n    url: i.html_url,\n    labels: i.labels?.map(l => l.name),\n    closedAt: i.closed_at\n  })),\n  pullRequests: prs.map(p => ({\n    number: p.number,\n    title: p.title,\n    url: p.html_url,\n    author: p.user?.login,\n    mergedAt: p.merged_at,\n    additions: p.additions,\n    deletions: p.deletions\n  }))\n};\n\nreturn [{ json: { activityData, config } }];"
+      },
+      "id": "process-data",
+      "name": "Process Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 0]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-4-20250514",
+        "options": {
+          "baseURL": "https://api.anthropic.com"
+        }
+      },
+      "id": "claude-api",
+      "name": "Generate Summary (Claude)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1,
+      "position": [1320, 0],
+      "credentials": {
+        "anthropicApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Anthropic API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Call Claude API directly via HTTP\nconst activityData = $json.activityData;\nconst config = $json.config;\nconst lang = config.REPORT_LANGUAGE || 'EN';\n\nconst langInstruction = lang === 'FR'\n  ? 'Génère le rapport en français.'\n  : 'Generate the report in English.';\n\nconst prompt = `You are a technical writer generating a weekly development report for a GitHub repository.\n\n${langInstruction}\n\nBased on the following GitHub activity data, generate a clean, well-structured Markdown report.\n\n## GitHub Activity Data:\n${JSON.stringify(activityData, null, 2)}\n\n## Instructions:\n1. Write an engaging executive summary (2-3 sentences)\n2. List key highlights and achievements\n3. Group notable commits by functional area\n4. Summarize closed issues with their titles and links\n5. Summarize merged PRs with their titles and links\n6. Add a \"Looking Ahead\" section based on open issues and patterns\n7. Use emoji section headers for visual appeal\n8. Keep it concise but informative\n9. Do NOT include empty sections`;\n\nconst response = await fetch('https://api.anthropic.com/v1/messages', {\n  method: 'POST',\n  headers: {\n    'Content-Type': 'application/json',\n    'x-api-key': config.ANTHROPIC_API_KEY,\n    'anthropic-version': '2023-06-01'\n  },\n  body: JSON.stringify({\n    model: 'claude-sonnet-4-20250514',\n    max_tokens: 4000,\n    messages: [{ role: 'user', content: prompt }]\n  })\n});\n\nconst result = await response.json();\nconst report = result.content[0].text;\n\nconst header = `# Weekly Report: ${activityData.repo}\\n**Period:** ${activityData.period.from} → ${activityData.period.to}\\n**Generated:** ${new Date().toISOString().split('T')[0]}\\n\\n---\\n\\n`;\n\nreturn [{ json: { fullReport: header + report, config } }];"
+      },
+      "id": "claude-generate",
+      "name": "Call Claude API",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "webhook-check",
+              "leftValue": "={{ $json.config.WEBHOOK_URL }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-webhook",
+      "name": "Has Webhook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1540, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: $json.fullReport.substring(0, 2000), username: 'Weekly Dev Report' }) }}",
+        "options": {}
+      },
+      "id": "send-webhook",
+      "name": "Send to Discord/Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1760, -100]
+    },
+    {
+      "parameters": {
+        "jsCode": "console.log('Report generated successfully (no webhook configured)');\nreturn [{ json: { success: true, report: $json.fullReport } }];"
+      },
+      "id": "no-webhook",
+      "name": "Log Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 100]
+    }
+  ],
+  "connections": {
+    "Every Friday 5PM": {
+      "main": [
+        [
+          {
+            "node": "Load Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Config": {
+      "main": [
+        [
+          {
+            "node": "Calculate Date Range",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Date Range": {
+      "main": [
+        [
+          {
+            "node": "Fetch Commits",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Issues",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch PRs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Commits": {
+      "main": [
+        [
+          {
+            "node": "Merge All Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Issues": {
+      "main": [
+        [
+          {
+            "node": "Merge All Data",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Fetch PRs": {
+      "main": [
+        [
+          {
+            "node": "Merge All Data",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge All Data": {
+      "main": [
+        [
+          {
+            "node": "Process Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Data": {
+      "main": [
+        [
+          {
+            "node": "Call Claude API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Claude API": {
+      "main": [
+        [
+          {
+            "node": "Has Webhook?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Webhook?": {
+      "main": [
+        [
+          {
+            "node": "Send to Discord/Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "weekly-report"
+    },
+    {
+      "name": "claude"
+    },
+    {
+      "name": "github"
+    }
+  ]
+}
